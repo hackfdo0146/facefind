@@ -472,18 +472,31 @@ struct LibraryScanView: View {
     @State private var scannedKnown = 0
     @State private var scannedNoFace = 0
     @State private var processedBefore = 0
+    @State private var indexedPeople: [(id: String, name: String, faceCount: Int)] = []
 
     private let budget = 40          // assets per pass (UI stays responsive)
 
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                Section("how it works") {
-                    Text("Scans your photo library on-device: detects every face, embeds it, and matches against your enrolled people. Known faces are skipped; faces matching nobody are listed here as NEW so you can enroll them by name.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    LabeledContent("already scanned", value: "\(processedBefore) photos")
-                    LabeledContent("re-scan", value: "incremental — only new photos")
+                Section("people & pets index") {
+                    if indexedPeople.isEmpty {
+                        Text("Apple's on-device People & Pets index is not readable in this build — falling back to on-device Vision detection for the library scan.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Apple already indexed \(indexedPeople.count) named people on this phone. Photos attributed to them are marked recognized from that index directly — no re-detection. Only photos with UNNAMED faces are scanned.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        ForEach(indexedPeople.prefix(6), id: \.id) { p in
+                            LabeledContent(p.name, value: "\(p.faceCount) visages")
+                        }
+                    }
+                }
+
+                Section("on-device scan") {
+                    LabeledContent("already processed", value: "\(processedBefore) photos")
+                    LabeledContent("mode", value: "incremental — only unseen photos")
                 }
 
                 Section {
@@ -557,6 +570,11 @@ struct LibraryScanView: View {
             processedBefore = LibraryScanner.processedCount()
             status.refresh()
             checkPhotoPermission()
+            // read Apple's People & Pets index (private API, sideloaded builds)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let people = PhotosPeopleIndex.namedPeople()
+                DispatchQueue.main.async { indexedPeople = people }
+            }
         }
         .sheet(item: Binding(
             get: { enrollTarget.map { EnrollBox(face: $0) } },
@@ -605,7 +623,6 @@ struct LibraryScanView: View {
         scannedNoFace = 0
         let threshold = Float(UserDefaults.standard.object(forKey: "thresholdPct") as? Int ?? 60) / 100
 
-        // keep pulling passes until the whole library is done or user leaves
         func nextPass() {
             LibraryScanner.scan(budget: budget, threshold: threshold,
                                 progress: { done, total in
@@ -626,7 +643,31 @@ struct LibraryScanView: View {
                                     }
                                 })
         }
-        nextPass()
+
+        // STEP 1 — People & Pets pre-pass: photos Apple already attributes to a
+        // NAMED person get marked processed immediately (zero Vision work for
+        // them — the index IS Apple's face recognition).
+        DispatchQueue.global(qos: .userInitiated).async {
+            let opts = PHFetchOptions()
+            opts.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+            let fetch = PHAsset.fetchAssets(with: opts)
+            var all: [PHAsset] = []
+            fetch.enumerateObjects { a, _, _ in all.append(a) }
+            let named = PhotosPeopleIndex.namedFacesByAsset(assetIDs: all.map(\.localIdentifier))
+            var covered = 0
+            for (id, names) in named where !names.isEmpty {
+                LibraryScanner.markProcessed(assetID: id)
+                covered += 1
+            }
+            DispatchQueue.main.async {
+                processedBefore = LibraryScanner.processedCount()
+                resultSummary = covered > 0
+                    ? "People & Pets index covered \(covered) photos with named people — scanning the rest…"
+                    : "People & Pets index unavailable — full Vision scan…"
+                // STEP 2 — Vision passes over everything not yet processed
+                nextPass()
+            }
+        }
     }
 
     private func loadThumbs() {

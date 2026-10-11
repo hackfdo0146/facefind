@@ -49,6 +49,14 @@ final class LibraryScanner {
         processed = []
     }
 
+    /// MARK: mark one asset as already-handled (People & Pets pre-pass uses this
+    /// so photos Apple already attributes to a named person are never re-scanned)
+    static func markProcessed(assetID: String) {
+        var p = processed
+        p.insert(assetID)
+        processed = p
+    }
+
     struct NewFace {
         let assetID: String
         let faceIndex: Int       // which face within that asset
