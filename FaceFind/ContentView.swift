@@ -473,6 +473,7 @@ struct LibraryScanView: View {
     @State private var scannedNoFace = 0
     @State private var processedBefore = 0
     @State private var indexedPeople: [(id: String, name: String, faceCount: Int)] = []
+    @State private var enrolledAfter: [(name: String, count: Int)] = []   // mirrors enrolment list
 
     private let budget = 40          // assets per pass (UI stays responsive)
 
@@ -584,8 +585,10 @@ struct LibraryScanView: View {
                     Section("enroll this face as") {
                         TextField("person's name", text: $enrollName)
                         Button {
-                            if LibraryScanner.enroll(face: box.face, name: enrollName.trimmingCharacters(in: .whitespaces)) {
+                            let personName = enrollName.trimmingCharacters(in: .whitespaces)
+                            if LibraryScanner.enroll(face: box.face, name: personName) {
                                 newFaces.removeAll { $0.assetID == box.face.assetID && $0.faceIndex == box.face.faceIndex }
+                                enrolledAfter = FaceDatabase.shared.people()
                                 status.refresh()
                             }
                             enrollTarget = nil
@@ -594,6 +597,13 @@ struct LibraryScanView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(enrollName.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                    if !enrolledAfter.isEmpty {
+                        Section("enrolled now") {
+                            ForEach(enrolledAfter, id: \.name) { p in
+                                LabeledContent(p.name, value: "\(p.count) faceprint\(p.count == 1 ? "" : "s")")
+                            }
+                        }
                     }
                 }
                 .navigationTitle("new person")
