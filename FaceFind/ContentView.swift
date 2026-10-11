@@ -18,7 +18,7 @@ struct ContentView: View {
     @StateObject private var status = StatusBox()
 
     enum Screen: Hashable {
-        case enrolment, recognition, settings
+        case enrolment, recognition, settings, library
     }
 
     var body: some View {
@@ -50,6 +50,11 @@ struct ContentView: View {
                            icon: "eye.fill",
                            color: .green) { path.append(.recognition) }
 
+                MenuButton(title: "library scan",
+                           subtitle: "find NEW faces in your photo library",
+                           icon: "photo.stack",
+                           color: .purple) { path.append(.library) }
+
                 MenuButton(title: "settings",
                            subtitle: "thresholds, frame rate, database",
                            icon: "gearshape.fill",
@@ -63,6 +68,7 @@ struct ContentView: View {
                 case .enrolment:   EnrolmentView()
                 case .recognition: RecognitionView()
                 case .settings:    SettingsView()
+                case .library:     LibraryScanView()
                 }
             }
         }
@@ -450,6 +456,213 @@ struct CameraPreviewView: UIViewRepresentable {
         return v
     }
     func updateUIView(_ uiView: PreviewContainer, context: Context) {}
+}
+
+// MARK: - LIBRARY SCAN screen (find NEW faces in the photo library)
+struct LibraryScanView: View {
+    @StateObject private var status = StatusBox()
+    @State private var permissionDenied = false
+    @State private var scanning = false
+    @State private var progressText = ""
+    @State private var resultSummary = ""
+    @State private var newFaces: [LibraryScanner.NewFace] = []
+    @State private var thumbs: [String: UIImage] = [:]        // assetID → thumbnail
+    @State private var enrollTarget: LibraryScanner.NewFace? = nil
+    @State private var enrollName = ""
+    @State private var scannedKnown = 0
+    @State private var scannedNoFace = 0
+    @State private var processedBefore = 0
+
+    private let budget = 40          // assets per pass (UI stays responsive)
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section("how it works") {
+                    Text("Scans your photo library on-device: detects every face, embeds it, and matches against your enrolled people. Known faces are skipped; faces matching nobody are listed here as NEW so you can enroll them by name.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    LabeledContent("already scanned", value: "\(processedBefore) photos")
+                    LabeledContent("re-scan", value: "incremental — only new photos")
+                }
+
+                Section {
+                    Button {
+                        startScan()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            if scanning {
+                                ProgressView()
+                                Text(progressText).font(.footnote)
+                            } else {
+                                Label("scan library for new faces", systemImage: "magnifyingglass")
+                            }
+                            Spacer()
+                        }
+                        .frame(minHeight: 40)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(scanning)
+                    .listRowInsets(EdgeInsets())
+                }
+
+                if !resultSummary.isEmpty {
+                    Section("last scan") {
+                        Text(resultSummary).font(.footnote)
+                    }
+                }
+
+                if !newFaces.isEmpty {
+                    Section("new faces (\(newFaces.count)) — tap to enroll") {
+                        ForEach(Array(newFaces.enumerated()), id: \.offset) { idx, f in
+                            Button {
+                                enrollTarget = f
+                                enrollName = ""
+                            } label: {
+                                HStack(spacing: 12) {
+                                    if let t = thumbs[f.assetID] {
+                                        Image(uiImage: t)
+                                            .resizable().scaledToFill()
+                                            .frame(width: 56, height: 56)
+                                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    } else {
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .fill(Color.gray.opacity(0.2))
+                                            .frame(width: 56, height: 56)
+                                            .overlay(ProgressView())
+                                    }
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("unknown face — face #\(f.faceIndex + 1)")
+                                            .font(.body.weight(.medium))
+                                            .foregroundStyle(.primary)
+                                        Text("closest match: \(f.bestName ?? "nobody") (\(Int(f.bestSimilarity * 100))%)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "person.badge.plus")
+                                        .foregroundStyle(.blue)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("library scan")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            processedBefore = LibraryScanner.processedCount()
+            status.refresh()
+            checkPhotoPermission()
+        }
+        .sheet(item: Binding(
+            get: { enrollTarget.map { EnrollBox(face: $0) } },
+            set: { enrollTarget = $0?.face })) { box in
+            NavigationStack {
+                Form {
+                    Section("enroll this face as") {
+                        TextField("person's name", text: $enrollName)
+                        Button {
+                            if LibraryScanner.enroll(face: box.face, name: enrollName.trimmingCharacters(in: .whitespaces)) {
+                                newFaces.removeAll { $0.assetID == box.face.assetID && $0.faceIndex == box.face.faceIndex }
+                                status.refresh()
+                            }
+                            enrollTarget = nil
+                        } label: {
+                            Text("save faceprint").frame(minHeight: 36)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(enrollName.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                }
+                .navigationTitle("new person")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("cancel") { enrollTarget = nil }
+                    }
+                }
+            }
+            .presentationDetents([.medium])
+        }
+        .alert("photo library access denied", isPresented: $permissionDenied) {
+            Button("open settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+            }
+            Button("cancel", role: .cancel) {}
+        } message: {
+            Text("FaceFind needs full photo library access to scan for new faces. Enable it in Settings → FaceFind → Photos.")
+        }
+    }
+
+    private func startScan() {
+        scanning = true
+        resultSummary = ""
+        scannedKnown = 0
+        scannedNoFace = 0
+        let threshold = Float(UserDefaults.standard.object(forKey: "thresholdPct") as? Int ?? 60) / 100
+
+        // keep pulling passes until the whole library is done or user leaves
+        func nextPass() {
+            LibraryScanner.scan(budget: budget, threshold: threshold,
+                                progress: { done, total in
+                                    progressText = "\(done)/\(total) photos…"
+                                },
+                                completion: { r in
+                                    newFaces.append(contentsOf: r.newlyFound)
+                                    scannedKnown += r.knownFaces
+                                    scannedNoFace += r.noFaceAssets
+                                    processedBefore = LibraryScanner.processedCount()
+                                    resultSummary = "\(r.scanned) photos scanned · \(scannedKnown) known faces skipped · \(newFaces.count) new faces found · \(scannedNoFace) photos without faces"
+                                    loadThumbs()
+                                    if !r.done {
+                                        nextPass()
+                                    } else {
+                                        scanning = false
+                                        progressText = ""
+                                    }
+                                })
+        }
+        nextPass()
+    }
+
+    private func loadThumbs() {
+        let ids = Set(newFaces.map(\.assetID)).intersection(Set(thumbs.keys.map { $0 })).symmetricDifference(Set(newFaces.map(\.assetID)))
+        for id in ids {
+            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else { continue }
+            let opts = PHImageRequestOptions()
+            opts.deliveryMode = .fastFormat
+            opts.isSynchronous = false
+            PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 160, height: 160),
+                                                  contentMode: .aspectFill, options: opts) { img, _ in
+                if let img { thumbs[id] = img }
+            }
+        }
+    }
+
+    private func checkPhotoPermission() {
+        switch PHPhotoLibrary.authorizationStatus(for: .readWrite) {
+        case .authorized, .limited:
+            break
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { st in
+                if st == .denied || st == .restricted {
+                    DispatchQueue.main.async { permissionDenied = true }
+                }
+            }
+        default:
+            permissionDenied = true
+        }
+    }
+}
+
+// Identifiable wrapper for the enroll sheet
+struct EnrollBox: Identifiable {
+    let face: LibraryScanner.NewFace
+    var id: String { face.assetID + "-\(face.faceIndex)" }
 }
 
 // MARK: - pickers (library + still camera)

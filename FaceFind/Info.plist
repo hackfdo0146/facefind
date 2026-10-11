@@ -19,7 +19,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>The live-camera tab streams video on-device to detect and recognize faces you point the camera at. Nothing leaves the device.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Pick an existing photo to register a person's face from your library.</string>
+	<string>The library scan detects faces in your photos on-device to find people not yet enrolled. Photos never leave the phone.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
