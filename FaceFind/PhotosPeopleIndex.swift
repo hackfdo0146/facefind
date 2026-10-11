@@ -47,37 +47,44 @@ enum PhotosPeopleIndex {
         let fetchSel = NSSelectorFromString("fetchPersonsWithOptions:")
         guard cls.responds(to: fetchSel) else { return [] }
 
-        guard let fetchResult = catchBlocks({ cls.perform(fetchSel, with: nil)?.takeUnretainedValue() }) as? NSObject
-        else { return [] }
-
-        let countSel = NSSelectorFromString("count")
-        let objSel = NSSelectorFromString("objectAtIndex:")
-        guard fetchResult.responds(to: countSel),
-              let nsTotal = fetchResult.perform(countSel).takeUnretainedValue() as? NSNumber,
-              nsTotal.intValue > 0
+        // Result is a PHFetchResult — read its .count VIA THE PUBLIC API.
+        // NEVER perform().takeUnretainedValue() a scalar-returning method
+        // (NSUInteger count) — that's the exact EXC_BREAKPOINT trap the first
+        // build crashed with (atos: PhotosPeopleIndex.swift:56).
+        guard let fetchResult = catchBlocks({ cls.perform(fetchSel, with: nil)?.takeUnretainedValue() })
+                as? PHFetchResult<PHObject>,
+              fetchResult.count > 0
         else { return [] }
 
         var out: [(String, String, Int)] = []
-        for i in 0..<nsTotal.intValue {
-            guard let person = fetchResult.perform(objSel, with: i).takeUnretainedValue() as? NSObject
-            else { continue }
+        for i in 0..<fetchResult.count {
+            guard let person = fetchResult.object(at: i) as? NSObject else { continue }
             let nameSel = NSSelectorFromString("name")
             let idSel = NSSelectorFromString("localIdentifier")
-            let fcSel = NSSelectorFromString("faceCount")
             guard person.responds(to: nameSel), person.responds(to: idSel) else { continue }
             let rawName = person.perform(nameSel).takeUnretainedValue() as? String ?? ""
             let name = rawName.trimmingCharacters(in: .whitespaces)
             guard !name.isEmpty else { continue }                 // named visages only
             let id = person.perform(idSel).takeUnretainedValue() as? String ?? ""
             guard !id.isEmpty else { continue }
-            var fc = 0
-            if person.responds(to: fcSel) {
-                let v = person.perform(fcSel).takeUnretainedValue()
-                fc = (v as? NSNumber)?.intValue ?? (v as? Int) ?? 0
-            }
+            // faceCount is a SCALAR (unsigned long long) — perform would trap.
+            // Count via the PHFace.fetchFacesForPerson fetch result instead.
+            let fc = faceCount(ofPerson: person)
             out.append((id, name, fc))
         }
         return out
+    }
+
+    // MARK: face count per person (PHFace.fetchFacesForPerson — object return, safe)
+    private static func faceCount(ofPerson person: NSObject) -> Int {
+        guard let faceCls = NSClassFromString("PHFace") as? NSObject.Type,
+              faceCls.responds(to: NSSelectorFromString("fetchFacesForPerson:options:"))
+        else { return 0 }
+        let result = catchBlocks {
+            faceCls.perform(NSSelectorFromString("fetchFacesForPerson:options:"),
+                            with: person, with: nil)?.takeUnretainedValue()
+        }
+        return (result as? PHFetchResult<PHObject>)?.count ?? 0
     }
 
     // MARK: ALL faces PhotoKit indexed, grouped per asset (any person state)
