@@ -66,26 +66,30 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
 
     // MARK: camera start/stop
     func start() {
-        queue.async { self._start() }
+        queue.async { self._startSync() }
     }
 
     // position: .front (default, mirrored like a selfie) or .back
     static var preferredPosition: AVCaptureDevice.Position = .front
 
     func switchCamera() {
+        // Runs entirely on `queue` — one synchronous path, no nested async
+        // (the previous enqueue-of-enqueue shape left the preview black: the
+        // second _startSync saw isRunning==true mid-rebuild and never restarted
+        // the pipeline, so the session sat configured-but-paused).
         queue.async { [weak self] in
-            guard let self,
-                  let input = self.session.inputs.first as? AVCaptureDeviceInput else { return }
-            Self.preferredPosition = input.device.position == .front ? .back : .front
-            self._start()
+            guard let self else { return }
+            if let input = self.session.inputs.first as? AVCaptureDeviceInput {
+                Self.preferredPosition = input.device.position == .front ? .back : .front
+            } else {
+                Self.preferredPosition = Self.preferredPosition == .front ? .back : .front
+            }
+            self._startSync()
         }
     }
 
-    private func _start() {
-        queue.async { self._startSync() }
-    }
-
     private func _startSync() {
+        if session.isRunning { session.stopRunning() }
         session.beginConfiguration()
         // drop ALL existing video inputs (switch = remove + re-add clean)
         for input in session.inputs where input is AVCaptureDeviceInput {
@@ -112,7 +116,9 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
         }
         session.commitConfiguration()
         reloadDatabase()
-        if !session.isRunning { session.startRunning() }
+        // ALWAYS (re)start: after a rebuild the pipeline must be running or the
+        // preview layer gets no frames = black screen.
+        session.startRunning()
     }
 
     func stop() {
