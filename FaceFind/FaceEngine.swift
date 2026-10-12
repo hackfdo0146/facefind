@@ -72,6 +72,27 @@ enum FaceEngine {
         return out
     }
 
+    // MARK: detect + embed EVERY face in a still photo (multi-person recognition)
+    struct StillFace {
+        let box: CGRect              // normalized Vision coords (bottom-left origin)
+        let vector: [Float]          // embedding of the face crop (empty = embed failed)
+    }
+
+    static func analyzeStill(image: CGImage) -> [StillFace] {
+        let detect = VNDetectFaceRectanglesRequest()
+        detect.revision = VNDetectFaceRectanglesRequestRevision2
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        guard (try? handler.perform([detect])) != nil,
+              let faces = detect.results, !faces.isEmpty
+        else { return [] }
+        var out: [StillFace] = []
+        for obs in faces {
+            let vector = embed(cropBox: obs.boundingBox, pixelBuffer: nil, cgImage: image, orientation: .up)
+            out.append(StillFace(box: obs.boundingBox, vector: vector))
+        }
+        return out
+    }
+
     // MARK: enrollment (photo/library path) — synchronous on caller's queue
     static func enroll(image: CGImage,
                        name: String,

@@ -18,7 +18,7 @@ struct ContentView: View {
     @StateObject private var status = StatusBox()
 
     enum Screen: Hashable {
-        case enrolment, recognition, settings, library
+        case enrolment, recognition, settings, library, photoRecognize
     }
 
     var body: some View {
@@ -50,6 +50,11 @@ struct ContentView: View {
                            icon: "eye.fill",
                            color: .green) { path.append(.recognition) }
 
+                MenuButton(title: "photo recognize",
+                           subtitle: "pick a photo — name every face in it",
+                           icon: "person.2.rectangle",
+                           color: .teal) { path.append(.photoRecognize) }
+
                 MenuButton(title: "library scan",
                            subtitle: "find NEW faces in your photo library",
                            icon: "photo.stack",
@@ -65,10 +70,11 @@ struct ContentView: View {
             .padding(.horizontal, 24)
             .navigationDestination(for: Screen.self) { screen in
                 switch screen {
-                case .enrolment:   EnrolmentView()
-                case .recognition: RecognitionView()
-                case .settings:    SettingsView()
-                case .library:     LibraryScanView()
+                case .enrolment:       EnrolmentView()
+                case .recognition:     RecognitionView()
+                case .settings:        SettingsView()
+                case .library:         LibraryScanView()
+                case .photoRecognize:  PhotoRecognizeView()
                 }
             }
         }
@@ -456,6 +462,183 @@ struct CameraPreviewView: UIViewRepresentable {
         return v
     }
     func updateUIView(_ uiView: PreviewContainer, context: Context) {}
+}
+
+// MARK: - PHOTO RECOGNIZE screen (all faces in ONE photo, matched vs enrollment)
+//
+// pick/capture → detect every face → embed each crop → match each against the
+// SQLite enrollment → overlay: green box + NAME + score for a confirmed person,
+// gray box + "unknown" otherwise. Below: recognized people with best score.
+// Boxes are drawn in IMAGE aspect coordinates (GeometryReader around a
+// scaledToFit image; Vision normalized coords flip vertically — UIKit is top-left).
+struct PhotoRecognizeView: View {
+    @StateObject private var status = StatusBox()
+    @State private var pickImage: UIImage? = nil
+    @State private var showPicker = false
+    @State private var showCamera = false
+    @State private var busy = false
+    @State private var message = ""
+    @State private var results: [PhotoFaceResult] = []
+
+    struct PhotoFaceResult: Identifiable {
+        let id: Int
+        let box: CGRect                // Vision normalized (bottom-left origin)
+        let name: String               // "" = unknown
+        let score: Float               // best cosine
+    }
+
+    var body: some View {
+        Form {
+            Section("photo") {
+                HStack(spacing: 10) {
+                    Button { showPicker = true } label: {
+                        Label("library", systemImage: "photo.on.rectangle")
+                            .frame(maxWidth: .infinity, minHeight: 40)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button { showCamera = true } label: {
+                        Label("camera", systemImage: "camera")
+                            .frame(maxWidth: .infinity, minHeight: 40)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                if let pickImage {
+                    // image + face-box overlay, aspect-fit matched
+                    GeometryReader { geo in
+                        let fit = aspectFitRect(imageSize: pickImage.size, in: geo.size)
+                        ZStack(alignment: .topLeading) {
+                            Image(uiImage: pickImage)
+                                .resizable().scaledToFit()
+                                .frame(width: fit.width, height: fit.height)
+                            ForEach(results) { r in
+                                // Vision: bottom-left origin, normalized → flip Y
+                                let x = fit.minX + r.box.minX * fit.width
+                                let w = r.box.width * fit.width
+                                let h = r.box.height * fit.height
+                                let y = fit.minY + (1 - r.box.maxY) * fit.height
+                                let known = !r.name.isEmpty
+                                VStack(alignment: .leading, spacing: 0) {
+                                    Text(known ? r.name : "unknown")
+                                        .font(.caption.bold())
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(known ? Color.green.opacity(0.85) : Color.gray.opacity(0.75))
+                                        .foregroundStyle(.white)
+                                        .clipShape(Capsule())
+                                    Text("\(Int(r.score * 100))%")
+                                        .font(.system(size: 9, weight: .semibold))
+                                        .padding(.horizontal, 4)
+                                        .foregroundStyle(.white)
+                                        .background(known ? Color.green.opacity(0.6) : Color.gray.opacity(0.5))
+                                        .clipShape(Capsule())
+                                }
+                                .offset(x: x, y: y - 2)
+                                RoundedRectangle(cornerRadius: 3)
+                                    .strokeBorder(known ? Color.green : Color.gray,
+                                                  lineWidth: known ? 3 : 2)
+                                    .frame(width: w, height: h)
+                                    .offset(x: x, y: y)
+                            }
+                        }
+                    }
+                    .frame(height: min(360, UIScreen.main.bounds.height * 0.42))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+            }
+
+            if busy {
+                Section {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("detecting faces…").foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if !message.isEmpty {
+                Section {
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundStyle(results.isEmpty ? Color.red : Color.secondary)
+                }
+            }
+
+            if !results.isEmpty {
+                Section("recognized — \(results.filter { !$0.name.isEmpty }.count)/\(results.count) faces") {
+                    // summary rows: name → best score (grouped per person)
+                    let named = Dictionary(grouping: results.filter { !$0.name.isEmpty }, by: \.name)
+                    if named.isEmpty {
+                        Text("no enrolled people recognized in this photo")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(named.keys.sorted(), id: \.self) { pname in
+                        let best = named[pname]!.map(\.score).max() ?? 0
+                        HStack {
+                            Image(systemName: "person.crop.circle.badge.checkmark")
+                                .foregroundStyle(.green)
+                            Text(pname).bold()
+                            Spacer()
+                            Text("\(Int(best * 100))% match").foregroundStyle(.secondary)
+                        }
+                    }
+                    let unknowns = results.filter { $0.name.isEmpty }.count
+                    if unknowns > 0 {
+                        Text("\(unknowns) unknown face\(unknowns == 1 ? "" : "s") — not in enrollment (add them via enrolment)")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .navigationTitle("photo recognize")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { status.refresh() }
+        .sheet(isPresented: $showPicker) { PhotoLibraryPicker(image: $pickImage) }
+        .sheet(isPresented: $showCamera) { PhotoCameraPicker(image: $pickImage) }
+        .onChange(of: pickImage) { _, img in
+            if img != nil { recognize() }
+        }
+    }
+
+    @MainActor
+    private func recognize() {
+        guard let ui = pickImage, let cg = ui.cgImage else { return }
+        busy = true; message = ""; results = []
+        let threshold = LiveFaceScanner.kThreshold      // same bar as live recognition
+        DispatchQueue.global(qos: .userInitiated).async {
+            let faces = FaceEngine.analyzeStill(image: cg)
+            let entries = FaceDatabase.shared.allEntries()
+            var out: [PhotoFaceResult] = []
+            for (i, f) in faces.enumerated() {
+                if f.vector.isEmpty { out.append(PhotoFaceResult(id: i, box: f.box, name: "", score: 0)); continue }
+                let m = FaceEngine.bestMatch(for: f.vector, entries: entries)
+                let name = (m?.similarity ?? 0) >= threshold ? (m?.name ?? "") : ""
+                out.append(PhotoFaceResult(id: i, box: f.box, name: name, score: m?.similarity ?? 0))
+            }
+            DispatchQueue.main.async {
+                busy = false
+                results = out
+                if faces.isEmpty {
+                    message = "no faces detected in that photo"
+                } else {
+                    let known = out.filter { !$0.name.isEmpty }.count
+                    message = "\(faces.count) face\(faces.count == 1 ? "" : "s") found · \(known) recognized"
+                }
+                LiveFaceScanner.shared.reloadDatabase()   // fresh after any enrolment change
+            }
+        }
+    }
+
+    // aspect-fit rect of an image in a container (for overlay math)
+    private func aspectFitRect(imageSize: CGSize, in container: CGSize) -> CGRect {
+        guard imageSize.width > 0, imageSize.height > 0, container.width > 0, container.height > 0
+        else { return .zero }
+        let scale = min(container.width / imageSize.width, container.height / imageSize.height)
+        let w = imageSize.width * scale, h = imageSize.height * scale
+        return CGRect(x: (container.width - w) / 2, y: (container.height - h) / 2, width: w, height: h)
+    }
 }
 
 // MARK: - LIBRARY SCAN screen (find NEW faces in the photo library)
