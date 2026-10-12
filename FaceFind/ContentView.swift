@@ -500,6 +500,7 @@ struct PhotoRecognizeView: View {
     @State private var busy = false
     @State private var message = ""
     @State private var results: [PhotoFaceResult] = []
+    @State private var useFront = true           // camera: front (selfie) or rear
 
     struct PhotoFaceResult: Identifiable {
         let id: Int
@@ -523,6 +524,27 @@ struct PhotoRecognizeView: View {
                             .frame(maxWidth: .infinity, minHeight: 40)
                     }
                     .buttonStyle(.bordered)
+                }
+
+                // front / back camera choice (button style, green active)
+                HStack(spacing: 10) {
+                    Button {
+                        useFront = true
+                    } label: {
+                        Label("front", systemImage: "person.crop.circle")
+                            .frame(maxWidth: .infinity, minHeight: 36)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(useFront ? .green : .gray)
+
+                    Button {
+                        useFront = false
+                    } label: {
+                        Label("back", systemImage: "camera.rotate")
+                            .frame(maxWidth: .infinity, minHeight: 36)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(useFront ? .gray : .green)
                 }
 
                 if let pickImage {
@@ -617,7 +639,7 @@ struct PhotoRecognizeView: View {
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { status.refresh() }
         .sheet(isPresented: $showPicker) { PhotoLibraryPicker(image: $pickImage) }
-        .sheet(isPresented: $showCamera) { PhotoCameraPicker(image: $pickImage) }
+        .sheet(isPresented: $showCamera) { PhotoCameraPicker(image: $pickImage, front: useFront) }
         .onChange(of: pickImage) { _, img in
             if img != nil { recognize() }
         }
@@ -955,11 +977,13 @@ struct PhotoLibraryPicker: UIViewControllerRepresentable {
 
 struct PhotoCameraPicker: UIViewControllerRepresentable {
     @Binding var image: UIImage?
+    var front: Bool = true                       // which camera to open with
     @Environment(\.dismiss) private var dismiss
 
     func makeUIViewController(context: Context) -> UIImagePickerController {
         let p = UIImagePickerController()
         p.sourceType = .camera
+        p.cameraDevice = front ? .front : .rear
         p.delegate = context.coordinator
         return p
     }
