@@ -69,11 +69,30 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
         queue.async { self._start() }
     }
 
+    // position: .front (default, mirrored like a selfie) or .back
+    static var preferredPosition: AVCaptureDevice.Position = .front
+
+    func switchCamera() {
+        queue.async { [weak self] in
+            guard let self,
+                  let input = self.session.inputs.first as? AVCaptureDeviceInput else { return }
+            Self.preferredPosition = input.device.position == .front ? .back : .front
+            self._start()
+        }
+    }
+
     private func _start() {
-        guard !session.isRunning else { return }
+        queue.async { self._startSync() }
+    }
+
+    private func _startSync() {
         session.beginConfiguration()
+        // drop ALL existing video inputs (switch = remove + re-add clean)
+        for input in session.inputs where input is AVCaptureDeviceInput {
+            session.removeInput(input)
+        }
         session.sessionPreset = .high
-        let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
+        let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: Self.preferredPosition)
             ?? AVCaptureDevice.default(for: .video)
         guard let device else { session.commitConfiguration(); return }
         guard let input = try? AVCaptureDeviceInput(device: device),
@@ -81,18 +100,19 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
               session.canAddOutput(videoOut)
         else { session.commitConfiguration(); return }
         session.addInput(input)
+        if session.outputs.isEmpty { session.addOutput(videoOut) }
         videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         videoOut.alwaysDiscardsLateVideoFrames = true
         videoOut.setSampleBufferDelegate(self, queue: queue)
-        session.addOutput(videoOut)
         if let conn = videoOut.connection(with: .video) {
+            // front camera is mirrored like a selfie; rear stays unmirrored
             conn.automaticallyAdjustsVideoMirroring = false
-            conn.isVideoMirrored = true                      // front camera: mirror like the user expects
+            conn.isVideoMirrored = (device.position == .front)
             orientation = conn.isVideoMirrored ? .leftMirrored : .right
         }
         session.commitConfiguration()
         reloadDatabase()
-        session.startRunning()
+        if !session.isRunning { session.startRunning() }
     }
 
     func stop() {

@@ -333,6 +333,8 @@ struct RecognitionView: View {
         ZStack {
             CameraPreviewView(session: LiveFaceScanner.shared.session)
                 .ignoresSafeArea(edges: .bottom)
+                .onAppear { LiveFaceScanner.shared.start() }
+                .onDisappear { LiveFaceScanner.shared.stop() }
 
             // ---- overlay: one view per tracked face ----
             GeometryReader { geo in
@@ -349,6 +351,25 @@ struct RecognitionView: View {
                         .padding(8)
                         .background(.ultraThinMaterial, in: Capsule())
                         .padding(.bottom, 90)
+                }
+            }
+
+            // ---- camera switch (front ↔ back) ----
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    Button {
+                        LiveFaceScanner.shared.switchCamera()
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath.camera")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 52, height: 52)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .padding(.trailing, 20)
+                    .padding(.bottom, 70)
                 }
             }
         }
