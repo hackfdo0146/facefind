@@ -89,6 +89,13 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     }
 
     private func _startSync() {
+        // idempotent fast-path (the pre-switch behavior): if the already-built
+        // input matches the requested camera and the session runs, do nothing.
+        if session.isRunning,
+           let current = session.inputs.first as? AVCaptureDeviceInput,
+           current.device.position == Self.preferredPosition {
+            return
+        }
         if session.isRunning { session.stopRunning() }
         session.beginConfiguration()
         // drop ALL existing video inputs (switch = remove + re-add clean)

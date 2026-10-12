@@ -333,8 +333,11 @@ struct RecognitionView: View {
         ZStack {
             CameraPreviewView(session: LiveFaceScanner.shared.session)
                 .ignoresSafeArea(edges: .bottom)
-                .onAppear { LiveFaceScanner.shared.start() }
-                .onDisappear { LiveFaceScanner.shared.stop() }
+                // NOTE: no stop-on-disappear here — a stop/start cycle during
+                // SwiftUI's push/pop transitions wedged the camera black. The
+                // session stays running for the app's lifetime (as it did when
+                // the screen first worked); entering recognition restarts it
+                // via checkPermission().
 
             // ---- overlay: one view per tracked face ----
             GeometryReader { geo in
