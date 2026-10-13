@@ -41,6 +41,12 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     // ---- camera ----
     let session = AVCaptureSession()
     private let videoOut = AVCaptureVideoDataOutput()
+    // ---- runtime diagnostics (camera plumbing health, for on-device logs) ----
+    private var pendingFirstFrameLog = false       // set on first output attach
+    private var firstFrameLogged = false
+    private var framesDelivered = 0                // captureOutput arrival count
+    private var framesProcessed = 0                // Vision analyze dispatch count
+    private var lastRebuildLog = "no rebuild yet"  // last _startSync outcome
     private let sessionQueue = DispatchQueue(label: "facefind.session")   // ALL config + start/stop
     private let queue = DispatchQueue(label: "facefind.capture")          // sample-buffer DELIVERY ONLY
     private let workQueue = DispatchQueue(label: "facefind.vision", qos: .userInitiated) // Vision work
@@ -68,9 +74,15 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     // MARK: camera start/stop (sessionQueue ONLY — Apple AVCam pattern:
     // startRunning/stopRunning MUST NOT share a queue with frame delivery or
     // beginConfiguration can deadlock against an in-flight buffer callback —
-    // that exact deadlock froze the screen on the previous switch build)
+    // that exact deadlock froze the screen on the earlier switch build).
+    // Rebuild strategy (AVCam): while the session runs, begin/commit a
+    // configuration that swaps ONLY the device input; the output stays
+    // attached and its connection re-forms. The output is added exactly once
+    // (when session.outputs is empty) and NEVER re-added — canAddOutput on an
+    // already-attached output returns false forever, which poisoned the old
+    // rebuild guard and killed the pipeline at the first switch.
     func start() {
-        sessionQueue.async { self._startSync() }
+        sessionQueue.async { [weak self] in self?._startSync() }
     }
 
     // position: .front (default, mirrored like a selfie) or .back
@@ -79,7 +91,8 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     func switchCamera() {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            if let input = self.session.inputs.first as? AVCaptureDeviceInput {
+            if let input = self.session.inputs.first(where: { $0 is AVCaptureDeviceInput })
+                as? AVCaptureDeviceInput {
                 Self.preferredPosition = input.device.position == .front ? .back : .front
             } else {
                 Self.preferredPosition = Self.preferredPosition == .front ? .back : .front
@@ -91,34 +104,45 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     private func _startSync() {
         // idempotent fast-path: requested camera already built and running
         if session.isRunning,
-           let current = session.inputs.first as? AVCaptureDeviceInput,
+           let current = session.inputs.first(where: { $0 is AVCaptureDeviceInput })
+               as? AVCaptureDeviceInput,
            current.device.position == Self.preferredPosition {
             return
         }
-        if session.isRunning { session.stopRunning() }
+
         session.beginConfiguration()
-        // drop ALL existing video inputs (switch = remove + re-add clean)
+        var device: AVCaptureDevice?
+        // drop the old device INPUT(s) only — the video output stays attached
         for input in session.inputs where input is AVCaptureDeviceInput {
             session.removeInput(input)
         }
         session.sessionPreset = .high
-        let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: Self.preferredPosition)
+        device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: Self.preferredPosition)
             ?? AVCaptureDevice.default(for: .video)
-        guard let device else { session.commitConfiguration(); return }
-        guard let input = try? AVCaptureDeviceInput(device: device),
-              session.canAddInput(input),
-              session.canAddOutput(videoOut)
-        else { session.commitConfiguration(); return }
-        session.addInput(input)
-        let firstBuild = session.outputs.isEmpty
-        if firstBuild {
-            session.addOutput(videoOut)
-            // delegate attach happens ONCE, on first build only; the delivery
-            // queue is separate from this config queue (no deadlock path)
-            videoOut.setSampleBufferDelegate(self, queue: queue)
+        guard let device else {
+            session.commitConfiguration()
+            NSLog("facefind.camera: NO DEVICE for position %ld — commit with no input", Int(Self.preferredPosition.rawValue))
+            return
         }
-        videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        videoOut.alwaysDiscardsLateVideoFrames = true
+        guard let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input)
+        else {
+            session.commitConfiguration()
+            NSLog("facefind.camera: device input FAILED (denied or add rejected) for position %ld", Int(Self.preferredPosition.rawValue))
+            return
+        }
+        session.addInput(input)
+
+        // attach the output + its once-only delegate exactly on the first build
+        if session.outputs.isEmpty {
+            videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            videoOut.alwaysDiscardsLateVideoFrames = true
+            videoOut.setSampleBufferDelegate(self, queue: queue)   // delivery queue: frames only
+            session.addOutput(videoOut)
+            pendingFirstFrameLog = true
+        } else {
+            videoOut.videoSettings = nil   // AVCam: leave a configured output untouched on swap
+        }
         if let conn = videoOut.connection(with: .video) {
             // front camera is mirrored like a selfie; rear stays unmirrored
             conn.automaticallyAdjustsVideoMirroring = false
@@ -126,12 +150,18 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
             orientation = conn.isVideoMirrored ? .leftMirrored : .right
         }
         session.commitConfiguration()
-        // first build → load the enrollment snapshot (already on sessionQueue,
-        // same serialization as reloadDatabase)
-        if firstBuild { databaseEntries = FaceDatabase.shared.allEntries() }
-        // ALWAYS (re)start: after a rebuild the pipeline must be running or the
-        // preview layer gets no frames = black screen.
-        session.startRunning()
+        // refresh the enrollment snapshot in the same transaction (cheap SQLite
+        // pass; serializes with reloadDatabase on this same queue)
+        databaseEntries = FaceDatabase.shared.allEntries()
+
+        // ALWAYS make the pipeline run: first build starts it; a live input
+        // swap (AVCam) keeps it running through the commit above.
+        if !session.isRunning { session.startRunning() }
+        lastRebuildLog = String(format: "pos=%ld running=%d in=%lu out=%lu mir=%d",
+                                Int(device.position.rawValue), session.isRunning ? 1 : 0,
+                                session.inputs.count, session.outputs.count,
+                                videoOut.connection(with: .video)?.isVideoMirrored == true ? 1 : 0)
+        NSLog("facefind.camera: rebuilt %@", lastRebuildLog as NSString)
     }
 
     func stop() {
@@ -153,6 +183,13 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        framesDelivered += 1
+        if pendingFirstFrameLog && !firstFrameLogged {
+            firstFrameLogged = true
+            let dims = CMVideoFormatDescriptionGetDimensions(CMSampleBufferGetFormatDescription(sampleBuffer)!)
+            NSLog("facefind.camera: FIRST FRAME DELIVERED %ldx%ld — pipeline confirmed live",
+                  Int(dims.width), Int(dims.height))
+        }
         frameCounter += 1
         guard frameCounter % Self.processEveryNthFrame == 0,      // every 3rd frame
               !busy,
@@ -169,6 +206,7 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
         workQueue.async { [weak self] in
             let detected = FaceEngine.analyze(pixelBuffer: pixelBuffer, orientation: ornt)
             self?.integrate(detected: detected, at: thisCounter)
+            self?.framesProcessed += 1
             self?.busy = false
         }
     }
