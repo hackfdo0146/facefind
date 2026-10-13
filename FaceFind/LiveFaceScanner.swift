@@ -41,7 +41,8 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     // ---- camera ----
     let session = AVCaptureSession()
     private let videoOut = AVCaptureVideoDataOutput()
-    private let queue = DispatchQueue(label: "facefind.capture")          // camera delegate queue
+    private let sessionQueue = DispatchQueue(label: "facefind.session")   // ALL config + start/stop
+    private let queue = DispatchQueue(label: "facefind.capture")          // sample-buffer DELIVERY ONLY
     private let workQueue = DispatchQueue(label: "facefind.vision", qos: .userInitiated) // Vision work
     private let ciContext = CIContext()
 
@@ -64,20 +65,19 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     private var databaseEntries: [FaceDatabase.Entry] = []
     private var orientation: CGImagePropertyOrientation = .right
 
-    // MARK: camera start/stop
+    // MARK: camera start/stop (sessionQueue ONLY — Apple AVCam pattern:
+    // startRunning/stopRunning MUST NOT share a queue with frame delivery or
+    // beginConfiguration can deadlock against an in-flight buffer callback —
+    // that exact deadlock froze the screen on the previous switch build)
     func start() {
-        queue.async { self._startSync() }
+        sessionQueue.async { self._startSync() }
     }
 
     // position: .front (default, mirrored like a selfie) or .back
     static var preferredPosition: AVCaptureDevice.Position = .front
 
     func switchCamera() {
-        // Runs entirely on `queue` — one synchronous path, no nested async
-        // (the previous enqueue-of-enqueue shape left the preview black: the
-        // second _startSync saw isRunning==true mid-rebuild and never restarted
-        // the pipeline, so the session sat configured-but-paused).
-        queue.async { [weak self] in
+        sessionQueue.async { [weak self] in
             guard let self else { return }
             if let input = self.session.inputs.first as? AVCaptureDeviceInput {
                 Self.preferredPosition = input.device.position == .front ? .back : .front
@@ -89,8 +89,7 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     }
 
     private func _startSync() {
-        // idempotent fast-path (the pre-switch behavior): if the already-built
-        // input matches the requested camera and the session runs, do nothing.
+        // idempotent fast-path: requested camera already built and running
         if session.isRunning,
            let current = session.inputs.first as? AVCaptureDeviceInput,
            current.device.position == Self.preferredPosition {
@@ -111,10 +110,15 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
               session.canAddOutput(videoOut)
         else { session.commitConfiguration(); return }
         session.addInput(input)
-        if session.outputs.isEmpty { session.addOutput(videoOut) }
+        let firstBuild = session.outputs.isEmpty
+        if firstBuild {
+            session.addOutput(videoOut)
+            // delegate attach happens ONCE, on first build only; the delivery
+            // queue is separate from this config queue (no deadlock path)
+            videoOut.setSampleBufferDelegate(self, queue: queue)
+        }
         videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         videoOut.alwaysDiscardsLateVideoFrames = true
-        videoOut.setSampleBufferDelegate(self, queue: queue)
         if let conn = videoOut.connection(with: .video) {
             // front camera is mirrored like a selfie; rear stays unmirrored
             conn.automaticallyAdjustsVideoMirroring = false
@@ -122,20 +126,27 @@ final class LiveFaceScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
             orientation = conn.isVideoMirrored ? .leftMirrored : .right
         }
         session.commitConfiguration()
-        reloadDatabase()
+        // first build → load the enrollment snapshot (already on sessionQueue,
+        // same serialization as reloadDatabase)
+        if firstBuild { databaseEntries = FaceDatabase.shared.allEntries() }
         // ALWAYS (re)start: after a rebuild the pipeline must be running or the
         // preview layer gets no frames = black screen.
         session.startRunning()
     }
 
     func stop() {
-        queue.async {
+        sessionQueue.async {
             if self.session.isRunning { self.session.stopRunning() }
         }
     }
 
     func reloadDatabase() {
-        databaseEntries = FaceDatabase.shared.allEntries()     // called on queue OK (SQLite single-conn)
+        // snapshot swap on the config queue serializes with camera rebuilds;
+        // workQueue reads `databaseEntries` (value-type array — safe read)
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.databaseEntries = FaceDatabase.shared.allEntries()
+        }
     }
 
     // MARK: frame delegate
