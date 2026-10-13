@@ -128,13 +128,15 @@ struct MenuButton: View {
 // MARK: - ENROLMENT screen
 struct EnrolmentView: View {
     @StateObject private var status = StatusBox()
-    @State private var pickImage: UIImage? = nil
+    @State private var pickImage: UIImage? = nil          // single (camera) path
+    @State private var pickImages: [UIImage] = []         // multi (library) path
     @State private var showPicker = false
     @State private var showCamera = false
     @State private var name = ""
     @State private var message = ""
     @State private var ok = false
     @State private var busy = false
+    @State private var progress: Double = 0               // batch enrollment progress
     @State private var existing: [(name: String, count: Int)] = []
 
     var body: some View {
@@ -145,19 +147,46 @@ struct EnrolmentView: View {
                 // photo source buttons (button style, not checkboxes)
                 HStack(spacing: 10) {
                     Button { showPicker = true } label: {
-                        Label("library", systemImage: "photo.on.rectangle")
+                        Label(pickImages.count > 1 ? "library (\(pickImages.count))" : "library",
+                              systemImage: "photo.on.rectangle")
                             .frame(maxWidth: .infinity, minHeight: 40)
                     }
                     .buttonStyle(.bordered)
 
-                    Button { showCamera = true } label: {
+                    Button {
+                        showCamera = true
+                    } label: {
                         Label("camera", systemImage: "camera")
                             .frame(maxWidth: .infinity, minHeight: 40)
                     }
                     .buttonStyle(.bordered)
                 }
+                Text("library = multi-select — one person, several photos")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
 
-                if let pickImage {
+                // preview: single photo OR numbered thumbnails of the batch
+                if pickImages.count > 1 {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(Array(pickImages.enumerated()), id: \.offset) { idx, img in
+                                Image(uiImage: img)
+                                    .resizable().scaledToFill()
+                                    .frame(width: 64, height: 64)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    .overlay(alignment: .bottomTrailing) {
+                                        Text("\(idx + 1)")
+                                            .font(.system(size: 10, weight: .bold))
+                                            .padding(3)
+                                            .background(Circle().fill(Color.accentColor.opacity(0.85)))
+                                            .foregroundStyle(.white)
+                                            .padding(2)
+                                    }
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                } else if let pickImage {
                     Image(uiImage: pickImage)
                         .resizable().scaledToFit()
                         .frame(maxHeight: 180)
@@ -165,14 +194,25 @@ struct EnrolmentView: View {
                         .frame(maxWidth: .infinity)
                 }
 
+                if busy, progress > 0 {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ProgressView(value: progress)
+                        Text("enrolling photo \(Int(progress * Double(max(pickImages.count, 1))) ) of \(pickImages.count)…")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Button {
                     enroll()
                 } label: {
-                    Text(busy ? "embedding faceprint..." : "save faceprint")
+                    Text(busy
+                         ? "enrolling \(pickImages.count) photos…"
+                         : (pickImages.count > 1 ? "save \(pickImages.count) faceprints" : "save faceprint"))
                         .frame(maxWidth: .infinity, minHeight: 42)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(pickImage == nil
+                .disabled(hasSelection == false
                           || name.trimmingCharacters(in: .whitespaces).isEmpty
                           || busy)
             }
@@ -200,27 +240,59 @@ struct EnrolmentView: View {
             existing = FaceDatabase.shared.people()
             status.refresh()
         }
-        .sheet(isPresented: $showPicker) { PhotoLibraryPicker(image: $pickImage) }
+        .sheet(isPresented: $showPicker) {
+            PhotoLibraryPicker(image: $pickImage,
+                               images: $pickImages,
+                               multiple: true)
+        }
         .sheet(isPresented: $showCamera) { PhotoCameraPicker(image: $pickImage) }
+        .onChange(of: pickImage) { _, img in
+            // camera path: single selection replaces the batch
+            if img != nil { pickImages = [] }
+        }
     }
+
+    // a selection exists in either path
+    private var hasSelection: Bool { pickImage != nil || !pickImages.isEmpty }
 
     private func enroll() {
         let personName = name.trimmingCharacters(in: .whitespaces)
-        guard let ui = pickImage, let cg = ui.cgImage else { return }
+        // normalize to a batch (multi-select library) or a single (camera) photo
+        let batch: [UIImage] = pickImages.count > 0 ? pickImages : (pickImage.map { [$0] } ?? [])
+        guard !batch.isEmpty, personName.isEmpty == false else { return }
         busy = true; message = ""; ok = false
+        progress = 0
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let error = FaceEngine.enroll(image: cg, name: personName, db: FaceDatabase.shared)
+            var enrolled = 0
+            var skipped = 0          // photos with no detectable face
+            var failures = 0
+            for (i, ui) in batch.enumerated() {
+                guard let cg = ui.cgImage else { failures += 1; continue }
+                let error = FaceEngine.enroll(image: cg, name: personName, db: FaceDatabase.shared)
+                if error == nil {
+                    enrolled += 1
+                } else if error == "no face detected in that photo" {
+                    skipped += 1
+                } else {
+                    failures += 1
+                }
+                let done = Double(i + 1) / Double(batch.count)
+                DispatchQueue.main.async { progress = done }
+            }
             DispatchQueue.main.async {
                 busy = false
-                if let error {
-                    ok = false
-                    message = error
-                } else {
-                    ok = true
-                    message = "\(personName) enrolled successfully"
+                let okBatch = enrolled > 0
+                ok = okBatch
+                var parts: [String] = []
+                parts.append("\(enrolled) faceprint\(enrolled == 1 ? "" : "s") saved for \(personName)")
+                if skipped > 0 { parts.append("\(skipped) photo\(skipped == 1 ? "" : "s") had no detectable face") }
+                if failures > 0 { parts.append("\(failures) failed") }
+                message = parts.joined(separator: " · ")
+                if okBatch {
                     LiveFaceScanner.shared.reloadDatabase()   // live matching sees them now
                     pickImage = nil
+                    pickImages = []
                     name = ""
                 }
                 existing = FaceDatabase.shared.people()
@@ -950,12 +1022,13 @@ import PhotosUI
 
 struct PhotoLibraryPicker: UIViewControllerRepresentable {
     @Binding var image: UIImage?
+    var multiple: Bool = false                   // selectionLimit 0 = unlimited
     @Environment(\.dismiss) private var dismiss
 
     func makeUIViewController(context: Context) -> PHPickerViewController {
         var cfg = PHPickerConfiguration()
         cfg.filter = .images
-        cfg.selectionLimit = 1
+        cfg.selectionLimit = multiple ? 0 : 1
         let p = PHPickerViewController(configuration: cfg)
         p.delegate = context.coordinator
         return p
@@ -968,13 +1041,41 @@ struct PhotoLibraryPicker: UIViewControllerRepresentable {
         init(_ parent: PhotoLibraryPicker) { self.parent = parent }
         func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
             defer { parent.dismiss() }
-            guard let item = results.first?.itemProvider,
-                  item.canLoadObject(ofClass: UIImage.self)
-            else { return }
-            item.loadObject(ofClass: UIImage.self) { obj, _ in
-                DispatchQueue.main.async { self.parent.image = obj as? UIImage }
+            if parent.multiple {
+                // multi-select: load every photo, deliver the batch
+                var images: [UIImage] = []
+                let group = DispatchGroup()
+                let lock = NSLock()
+                for item in results.map(\.itemProvider) where item.canLoadObject(ofClass: UIImage.self) {
+                    group.enter()
+                    item.loadObject(ofClass: UIImage.self) { obj, _ in
+                        if let img = obj as? UIImage {
+                            lock.lock(); images.append(img); lock.unlock()
+                        }
+                        group.leave()
+                    }
+                }
+                group.notify(queue: .main) {
+                    self.parent.images = images
+                }
+            } else {
+                guard let item = results.first?.itemProvider,
+                      item.canLoadObject(ofClass: UIImage.self)
+                else { return }
+                item.loadObject(ofClass: UIImage.self) { obj, _ in
+                    DispatchQueue.main.async { self.parent.image = obj as? UIImage }
+                }
             }
         }
+    }
+
+    // multi-select batch binding (only used when multiple == true)
+    @Binding var images: [UIImage]
+
+    init(image: Binding<UIImage?>, images: Binding<[UIImage]> = .constant([]), multiple: Bool = false) {
+        _image = image
+        _images = images
+        self.multiple = multiple
     }
 }
 
